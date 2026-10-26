@@ -1,7 +1,10 @@
 // Derived from
 // https://github.com/wooorm/linked-list/blob/d2390fe1cab9f780cfd34fa31c8fa8ede4ad674d/index.js
 
+import GLib from 'gi://GLib';
+
 export const TYPE_TEXT = 'text';
+export const TYPE_IMAGE = 'image';
 
 // Creates a new `Iterator` for looping over the `List`.
 class Iterator {
@@ -186,9 +189,7 @@ export class LLNode {
       return;
     }
 
-    if (this.type === TYPE_TEXT) {
-      this.list.bytes += this.text.length;
-    }
+    this.list.bytes += this._size();
 
     let entries = this.list.invertedIndex[hash];
     if (!entries) {
@@ -205,9 +206,7 @@ export class LLNode {
       return;
     }
 
-    if (this.type === TYPE_TEXT) {
-      this.list.bytes -= this.text.length;
-    }
+    this.list.bytes -= this._size();
 
     const entries = this.list.invertedIndex[hash];
     if (entries.length === 1) {
@@ -221,8 +220,24 @@ export class LLNode {
   _hash() {
     if (this.type === TYPE_TEXT) {
       return _hashText(this.text);
+    } else if (this.type === TYPE_IMAGE) {
+      this.checksum ??= GLib.compute_checksum_for_bytes(
+        GLib.ChecksumType.SHA256,
+        this.bytes,
+      );
+      return this.checksum;
     } else {
       return null;
+    }
+  }
+
+  _size() {
+    if (this.type === TYPE_TEXT) {
+      return this.text.length;
+    } else if (this.type === TYPE_IMAGE) {
+      return this.bytes.get_size();
+    } else {
+      return 0;
     }
   }
 }
@@ -340,15 +355,18 @@ export class LinkedList {
     return this.idsToItems[id];
   }
 
-  findTextItem(text) {
-    const entries = this.invertedIndex[_hashText(text)];
+  findItem(node) {
+    const entries = this.invertedIndex[node._hash()];
     if (!entries) {
       return null;
     }
 
     for (let i = entries.length - 1; i >= 0; i--) {
       const item = this.idsToItems[entries[i]];
-      if (item.type === TYPE_TEXT && item.text === text) {
+      if (
+        item.type === node.type &&
+        (item.type === TYPE_IMAGE || item.text === node.text)
+      ) {
         return item;
       }
     }

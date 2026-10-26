@@ -1,6 +1,7 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import * as DS from './dataStructures.js';
+import * as Cipher from './cipher.js';
 
 let EXTENSION_UUID;
 let CACHE_DIR;
@@ -8,6 +9,11 @@ const OLD_REGISTRY_FILE = GLib.build_filenamev([
   GLib.get_user_cache_dir(),
   'clipboard-indicator@tudmotu.com',
   'registry.txt',
+]);
+const LEGACY_DATABASE_FILE = GLib.build_filenamev([
+  GLib.get_user_cache_dir(),
+  'clipboard-history@alexsaveau.dev',
+  'database.log',
 ]);
 
 /**
@@ -28,6 +34,11 @@ const OP_TYPE_DELETE_TEXT = 2;
 const OP_TYPE_FAVORITE_ITEM = 3;
 const OP_TYPE_UNFAVORITE_ITEM = 4;
 const OP_TYPE_MOVE_ITEM_TO_END = 5;
+const OP_TYPE_SAVE_ENCRYPTED_TEXT = 6;
+const OP_TYPE_SAVE_ENCRYPTED_IMAGE = 7;
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 const MAX_WASTED_OPS = 500;
 let uselessOpCount;
@@ -70,20 +81,54 @@ export function buildClipboardStateFromLog(callback) {
   }
   uselessOpCount = 0;
 
-  Gio.File.new_for_path(DATABASE_FILE).read_async(0, null, (src, res) => {
-    try {
-      _parseLog(src.read_finish(res), callback);
-    } catch (e) {
-      if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
-        _readAndConsumeOldFormat(callback);
-      } else {
-        throw e;
+  Cipher.init(() => {
+    Gio.File.new_for_path(DATABASE_FILE).read_async(0, null, (src, res) => {
+      try {
+        _parseLog(src, src.read_finish(res), callback);
+      } catch (e) {
+        if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+          _migrateLegacyLog(callback);
+        } else {
+          throw e;
+        }
       }
-    }
+    });
   });
 }
 
-function _parseLog(stream, callback) {
+function _migrateLegacyLog(callback) {
+  Gio.File.new_for_path(LEGACY_DATABASE_FILE).read_async(
+    0,
+    null,
+    (src, res) => {
+      let stream;
+      try {
+        stream = src.read_finish(res);
+      } catch (e) {
+        if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+          _readAndConsumeOldFormat(callback);
+          return;
+        } else {
+          throw e;
+        }
+      }
+
+      _parseLog(src, stream, (entries, favorites, nextId) => {
+        const state = favorites.toArray().concat(entries.toArray());
+        state.forEach((entry, i) => (entry.diskId = i + 1));
+
+        resetDatabase(() => state);
+        src.delete_async(0, null, (src, res) => {
+          src.delete_finish(res);
+        });
+
+        callback(entries, favorites, nextId, state.length + 1);
+      });
+    },
+  );
+}
+
+function _parseLog(file, stream, callback) {
   stream = Gio.DataInputStream.new(stream);
   stream.set_byte_order(BYTE_ORDER);
 
@@ -92,17 +137,23 @@ function _parseLog(stream, callback) {
     favorites: new DS.LinkedList(),
     nextId: 1,
   };
-  _consumeStream(stream, state, callback);
+  _consumeStream(file, stream, state, callback);
 }
 
-function _consumeStream(stream, state, callback) {
+function _consumeStream(file, stream, state, callback) {
   const finish = () => {
     callback(state.entries, state.favorites, state.nextId);
   };
   const forceFill = (minBytes, fillCallback) => {
+    if (stream.get_buffer_size() < minBytes) {
+      stream.set_buffer_size(minBytes);
+    }
+
     stream.fill_async(/*count=*/ -1, 0, null, (src, res) => {
-      if (src.fill_finish(res) < minBytes) {
+      if (src.fill_finish(res) === 0) {
         finish();
+      } else if (src.get_available() < minBytes) {
+        forceFill(minBytes, fillCallback);
       } else {
         fillCallback();
       }
@@ -137,6 +188,25 @@ function _consumeStream(stream, state, callback) {
 
           loop();
         },
+      );
+    } else if (
+      opType === OP_TYPE_SAVE_ENCRYPTED_TEXT ||
+      opType === OP_TYPE_SAVE_ENCRYPTED_IMAGE
+    ) {
+      parseAvailableAware(
+        4,
+        () => {
+          const length = stream.read_uint32(null);
+          parseAvailableAware(length, () => {
+            const node = _decryptEntry(
+              opType,
+              stream.read_bytes(length, null).toArray(),
+            );
+            node.diskId = node.id = state.nextId++;
+            state.entries.append(node);
+          });
+        },
+        () => {},
       );
     } else if (opType === OP_TYPE_DELETE_TEXT) {
       uselessOpCount += 2;
@@ -180,7 +250,7 @@ function _consumeStream(stream, state, callback) {
     }
   }
 
-  parseAvailableAware = (minBytes, parse) => {
+  parseAvailableAware = (minBytes, parse, next = loop) => {
     const safeParse = (cont) => {
       try {
         parse();
@@ -200,8 +270,9 @@ function _consumeStream(stream, state, callback) {
           entries.prepend(node);
         };
 
+        const corruptedFile = file.get_parent().get_child('corrupted.log');
         addEntry('Your clipboard data has been corrupted and was moved to:');
-        addEntry('~/.cache/clipboard-history@alexsaveau.dev/corrupted.log');
+        addEntry(corruptedFile.get_path());
         addEntry('Please file a bug report at:');
         addEntry(
           'https://github.com/SUPERCILEX/gnome-clipboard-history/issues/new?assignees=&labels=bug&template=1-bug.md',
@@ -209,14 +280,7 @@ function _consumeStream(stream, state, callback) {
 
         try {
           if (
-            !Gio.File.new_for_path(DATABASE_FILE).move(
-              Gio.File.new_for_path(
-                GLib.build_filenamev([CACHE_DIR, 'corrupted.log']),
-              ),
-              Gio.FileCopyFlags.OVERWRITE,
-              null,
-              null,
-            )
+            !file.move(corruptedFile, Gio.FileCopyFlags.OVERWRITE, null, null)
           ) {
             console.log(EXTENSION_UUID, 'Failed to move database file');
           }
@@ -230,14 +294,34 @@ function _consumeStream(stream, state, callback) {
 
     if (stream.get_available() < minBytes) {
       forceFill(minBytes, () => {
-        safeParse(loop);
+        safeParse(next);
       });
     } else {
-      safeParse(loop);
+      safeParse(next);
     }
   };
 
   loop();
+}
+
+function _decryptEntry(opType, data) {
+  const plain = Cipher.decrypt(data);
+
+  const node = new DS.LLNode();
+  node.favorite = false;
+  if (opType === OP_TYPE_SAVE_ENCRYPTED_TEXT) {
+    node.type = DS.TYPE_TEXT;
+    node.text = decoder.decode(plain);
+  } else {
+    const mimetypeEnd = plain.indexOf(0);
+    const nameEnd = plain.indexOf(0, mimetypeEnd + 1);
+
+    node.type = DS.TYPE_IMAGE;
+    node.mimetype = decoder.decode(plain.subarray(0, mimetypeEnd));
+    node.name = decoder.decode(plain.subarray(mimetypeEnd + 1, nameEnd));
+    node.bytes = new GLib.Bytes(plain.subarray(nameEnd + 1));
+  }
+  return node;
 }
 
 function _readAndConsumeOldFormat(callback) {
@@ -344,11 +428,7 @@ export function resetDatabase(currentStateBuilder) {
           do {
             const entry = state[i];
 
-            if (entry.type === DS.TYPE_TEXT) {
-              _storeTextOp(entry.text)(dataStream);
-            } else {
-              throw new TypeError('Unknown type: ' + entry.type);
-            }
+            _storeEntryOp(entry)(dataStream);
             if (entry.favorite) {
               _updateFavoriteStatusOp(entry.diskId, true)(dataStream);
             }
@@ -364,15 +444,32 @@ export function resetDatabase(currentStateBuilder) {
   });
 }
 
-export function storeTextEntry(text) {
-  _appendBytesToLog(_storeTextOp(text), -5);
+export function storeEntry(entry) {
+  _appendBytesToLog(_storeEntryOp(entry), -5);
 }
 
-function _storeTextOp(text) {
+function _storeEntryOp(entry) {
   return (dataStream) => {
-    dataStream.put_byte(OP_TYPE_SAVE_TEXT, null);
-    dataStream.put_string(text, null);
-    dataStream.put_byte(0, null); // NUL terminator
+    let opType;
+    let plain;
+    if (entry.type === DS.TYPE_TEXT) {
+      opType = OP_TYPE_SAVE_ENCRYPTED_TEXT;
+      plain = encoder.encode(entry.text);
+    } else if (entry.type === DS.TYPE_IMAGE) {
+      opType = OP_TYPE_SAVE_ENCRYPTED_IMAGE;
+      const header = encoder.encode(`${entry.mimetype}\0${entry.name}\0`);
+      const image = entry.bytes.toArray();
+      plain = new Uint8Array(header.length + image.length);
+      plain.set(header);
+      plain.set(image, header.length);
+    } else {
+      throw new TypeError('Unknown type: ' + entry.type);
+    }
+
+    const box = Cipher.encrypt(plain);
+    dataStream.put_byte(opType, null);
+    dataStream.put_uint32(box.length, null);
+    dataStream.write_all(box, null);
     return true;
   };
 }

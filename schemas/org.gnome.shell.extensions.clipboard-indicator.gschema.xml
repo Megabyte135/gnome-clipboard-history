@@ -1,7 +1,7 @@
 <schemalist gettext-domain="gnome-shell-extensions">
   <schema
-      id="org.gnome.shell.extensions.clipboard-history"
-      path="/org/gnome/shell/extensions/clipboard-history/">
+      id="org.gnome.shell.extensions.clipboard-history-plus"
+      path="/org/gnome/shell/extensions/clipboard-history-plus/">
 
     <key type="i" name="history-size">
       <default>1000</default>
@@ -125,7 +125,7 @@
       <summary>Shortcut to cycle to the next clipboard entry</summary>
     </key>
     <key name="toggle-menu" type="as">
-      <default><![CDATA[['<Super><Shift>V']]]></default>
+      <default><![CDATA[['<Super>V']]]></default>
       <summary>Shortcut to open the clipboard history</summary>
     </key>
     <key name="toggle-private-mode" type="as">

@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
 import GObject from 'gi://GObject';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
@@ -45,6 +46,8 @@ const INDICATOR_ICON = 'edit-paste-symbolic';
 
 const PAGE_SIZE = 50;
 const MAX_VISIBLE_CHARS = 200;
+const THUMBNAIL_SIZE = 48;
+const TEXT_MIMETYPES = ['UTF8_STRING', 'STRING', 'TEXT'];
 
 let MAX_REGISTRY_LENGTH;
 let MAX_BYTES;
@@ -428,6 +431,8 @@ class ClipboardIndicator extends PanelMenu.Button {
 
     const menuItem = new PopupMenu.PopupMenuItem('', { hover: false });
     menuItem.setOrnament(PopupMenu.Ornament.NONE);
+    menuItem.thumbnail = new St.Icon({ icon_size: THUMBNAIL_SIZE });
+    menuItem.insert_child_below(menuItem.thumbnail, menuItem.label);
 
     menuItem.entry = entry;
     entry.menuItem = menuItem;
@@ -544,9 +549,14 @@ class ClipboardIndicator extends PanelMenu.Button {
     const entry = menuItem.entry;
     if (entry.type === DS.TYPE_TEXT) {
       menuItem.label.set_text(this._truncated(entry.text, MAX_VISIBLE_CHARS));
+      menuItem.thumbnail.gicon = null;
+    } else if (entry.type === DS.TYPE_IMAGE) {
+      menuItem.label.set_text(entry.name);
+      menuItem.thumbnail.gicon = new Gio.BytesIcon({ bytes: entry.bytes });
     } else {
       throw new TypeError('Unknown type: ' + entry.type);
     }
+    menuItem.thumbnail.visible = entry.type === DS.TYPE_IMAGE;
   }
 
   _favoriteToggle(menuItem) {
@@ -574,7 +584,7 @@ class ClipboardIndicator extends PanelMenu.Button {
     } else {
       entry.diskId = this.nextDiskId++;
 
-      Store.storeTextEntry(entry.text);
+      Store.storeEntry(entry);
       Store.updateFavoriteStatus(entry.diskId, true);
     }
   }
@@ -658,6 +668,8 @@ class ClipboardIndicator extends PanelMenu.Button {
     if (updateClipboard !== false) {
       if (entry.type === DS.TYPE_TEXT) {
         this._setClipboardText(entry.text);
+      } else if (entry.type === DS.TYPE_IMAGE) {
+        this._setClipboardImage(entry);
       } else {
         throw new TypeError('Unknown type: ' + entry.type);
       }
@@ -675,6 +687,18 @@ class ClipboardIndicator extends PanelMenu.Button {
 
     Clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
     Clipboard.set_text(St.ClipboardType.PRIMARY, text);
+  }
+
+  _setClipboardImage(entry) {
+    if (this._debouncing !== undefined) {
+      this._debouncing++;
+    }
+
+    Clipboard.set_content(
+      St.ClipboardType.CLIPBOARD,
+      entry.mimetype,
+      entry.bytes,
+    );
   }
 
   _triggerPasteHack() {
@@ -855,28 +879,29 @@ class ClipboardIndicator extends PanelMenu.Button {
     let entry = start;
 
     while (this.activeHistoryMenuItems < PAGE_SIZE) {
+      let content;
       if (entry.type === DS.TYPE_TEXT) {
-        let match = entry.text.toLowerCase().indexOf(query);
-        if (searchExp && match < 0) {
-          match = entry.text.search(searchExp);
-        }
-        if (match >= 0) {
-          this._addEntry(
-            entry,
-            entry === this.currentlySelectedEntry,
-            false,
-            forward ? undefined : 0,
-          );
-          entry.menuItem.label.set_text(
-            this._truncated(
-              entry.text,
-              match - 40,
-              match + MAX_VISIBLE_CHARS - 40,
-            ),
-          );
-        }
+        content = entry.text;
+      } else if (entry.type === DS.TYPE_IMAGE) {
+        content = entry.name;
       } else {
         throw new TypeError('Unknown type: ' + entry.type);
+      }
+
+      let match = content.toLowerCase().indexOf(query);
+      if (searchExp && match < 0) {
+        match = content.search(searchExp);
+      }
+      if (match >= 0) {
+        this._addEntry(
+          entry,
+          entry === this.currentlySelectedEntry,
+          false,
+          forward ? undefined : 0,
+        );
+        entry.menuItem.label.set_text(
+          this._truncated(content, match - 40, match + MAX_VISIBLE_CHARS - 40),
+        );
       }
 
       entry = forward ? entry.prevCyclic() : entry.nextCyclic();
@@ -919,6 +944,25 @@ class ClipboardIndicator extends PanelMenu.Button {
       return;
     }
 
+    const mimetypes = Clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD);
+    const imageMimetype = mimetypes.includes('image/png')
+      ? 'image/png'
+      : mimetypes.find((mimetype) => mimetype.startsWith('image/'));
+    const hasText = mimetypes.some(
+      (mimetype) =>
+        mimetype.startsWith('text/plain') || TEXT_MIMETYPES.includes(mimetype),
+    );
+    if (imageMimetype && !hasText) {
+      Clipboard.get_content(
+        St.ClipboardType.CLIPBOARD,
+        imageMimetype,
+        (_, bytes) => {
+          this._processClipboardImage(bytes, imageMimetype);
+        },
+      );
+      return;
+    }
+
     Clipboard.get_text(St.ClipboardType.CLIPBOARD, (_, text) => {
       this._processClipboardContent(text, true);
     });
@@ -933,7 +977,7 @@ class ClipboardIndicator extends PanelMenu.Button {
       const last = this.entries.last();
       text = this._processClipboardContent(text, false);
       if (
-        last &&
+        last?.type === DS.TYPE_TEXT &&
         text &&
         text.length !== last.text.length &&
         (text.endsWith(last.text) ||
@@ -959,9 +1003,38 @@ class ClipboardIndicator extends PanelMenu.Button {
       return;
     }
 
+    const entry = new DS.LLNode();
+    entry.type = DS.TYPE_TEXT;
+    entry.text = text;
+    this._processClipboardEntry(entry, selectEntry);
+
+    return text;
+  }
+
+  _processClipboardImage(bytes, mimetype) {
+    if (this._debouncing > 0) {
+      this._debouncing--;
+      return;
+    }
+
+    if (!bytes || bytes.get_size() === 0) {
+      return;
+    }
+
+    const entry = new DS.LLNode();
+    entry.type = DS.TYPE_IMAGE;
+    entry.bytes = bytes;
+    entry.mimetype = mimetype;
+    entry.name = `${_('Image')} ${GLib.DateTime.new_now_local().format(
+      '%Y-%m-%d %H:%M:%S',
+    )}`;
+    this._processClipboardEntry(entry, true);
+  }
+
+  _processClipboardEntry(newEntry, selectEntry) {
     let entry =
-      this.entries.findTextItem(text) ||
-      this.favoriteEntries.findTextItem(text);
+      this.entries.findItem(newEntry) ||
+      this.favoriteEntries.findItem(newEntry);
     if (entry) {
       const isFirst =
         entry === this.entries.last() || entry === this.favoriteEntries.last();
@@ -972,17 +1045,15 @@ class ClipboardIndicator extends PanelMenu.Button {
         this._selectEntry(entry, false);
       }
     } else {
-      entry = new DS.LLNode();
+      entry = newEntry;
       entry.id = this.nextId++;
       entry.diskId = CACHE_ONLY_FAVORITES ? undefined : this.nextDiskId++;
-      entry.type = DS.TYPE_TEXT;
-      entry.text = text;
       entry.favorite = false;
       this.entries.append(entry);
       this._addEntry(entry, selectEntry, false, 0);
 
       if (!CACHE_ONLY_FAVORITES) {
-        Store.storeTextEntry(text);
+        Store.storeEntry(entry);
       }
       this._pruneOldestEntries();
     }
@@ -994,8 +1065,6 @@ class ClipboardIndicator extends PanelMenu.Button {
         );
       });
     }
-
-    return text;
   }
 
   _moveEntryFirst(entry) {
@@ -1212,7 +1281,7 @@ class ClipboardIndicator extends PanelMenu.Button {
       } else {
         for (const entry of this.entries) {
           entry.diskId = this.nextDiskId++;
-          Store.storeTextEntry(entry.text);
+          Store.storeEntry(entry);
         }
       }
     }
